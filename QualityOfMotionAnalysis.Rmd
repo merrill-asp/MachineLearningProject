@@ -1,0 +1,108 @@
+---
+title: "Quality of Motion Analysis"
+author: "Merrill Asp"
+date: "June 4, 2017"
+output: html_document
+---
+
+## Overview
+
+We create a machine learning predictor for the Human Activity Recognition data from Groupware\@LES http://groupware.les.inf.puc-rio.br/har. We first perform some exploratory analysis, which leads us to build our predictor using a random forest method from data preprocessed with primary component analysis. We show that the resulting predictor is 81% to 82% accurate using 10-fold cross-validation, and finally we produce predictions for 20 observations in a testing dataset.
+
+## Loading and Preprocessing Data
+
+First we must load the prepared testing and training data
+
+```{r loadData, message=FALSE}
+library(caret)
+if(!file.exists("pml-training.csv")) {
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "pml-training.csv")
+}
+if(!file.exists("pml-testing.csv")) {
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "pml-testing.csv")
+}
+training.data.in <- read.csv("pml-training.csv")
+testing.data.in <- read.csv("pml-testing.csv")
+```
+
+For some simple preprocessing, we notice that the first column of the data is simply the row number, so we can remove it.
+```{r preprocess}
+all(training.data.in[,1] == 1:nrow(training.data.in))
+training.data.in <- training.data.in[,2:160]
+testing.data.in <- testing.data.in[,2:160]
+```
+Also, the testing dataset has several variables that all have missing values, and so cannot be used for prediction. We can remove these variables as well.
+```{r preprocess2}
+valid.predictors <- sapply(1:ncol(testing.data.in), function(i) !all(is.na(testing.data.in[,i])))
+training.data.in <- training.data.in[,valid.predictors]
+testing.data.in <- testing.data.in[,valid.predictors]
+```
+We also have a ``user_name`` variable, but we cannot rely on having the same users in our testing set, so we should remove this variable (this also prevents overfitting to particular users). Three other variables (``cvtd_timestamp``, ``new_window`` and ``num_window``) have little variation, so we choose to ignore them.
+```{r finalRemoval}
+predictors.to.remove <- c(1,4,5,6)
+training.data.in <- training.data.in[,-predictors.to.remove]
+testing.data.in <- testing.data.in[,-predictors.to.remove]
+dim(training.data.in)
+dim(testing.data.in)
+```
+We thus have 19622 observations of 55 variables to train with in order to verify against our 20 observations of those variables in the test data.
+
+## Exploratory Analysis
+
+The quality of motion, what we are trying to predict, is in the ``classe`` variable. There are many other variables relating to detailed aspects of subject motion. This is only a sample
+
+```{r graph, fig.height=3}
+library(ggplot2)
+ggplot(training.data.in, aes(x=roll_belt, y=yaw_belt, color=classe)) +
+  geom_point(alpha=0.5)
+```
+
+There seems to be no obvious way to distinguish the ``classe`` groups, at least from this first glance. A matrix of pair plots was also created for groups of ten variables at a time, which are too large and not informative enough to reproduce here.
+
+## Machine Learning Procedure
+
+There are a large number of variables, so we will check to see if any of the variables are highly correlated
+```{r correlationCheck}
+corr.matrix <- abs(cor(training.data.in[,-55])) # this removes the non-numeric classe column
+diag(corr.matrix) <- 0 # we ignore the correlation of variables with themselves
+which(corr.matrix > 0.9, arr.ind = TRUE)
+```
+Since many of our variables are highly correlated, doing primary component preprocessing should decrease variability and retain the most important information about our predictors. This will also help in the issue of having a large number of variables without obvious predicting power.
+```{r pca, cache=TRUE}
+library(caret)
+preProc <- preProcess(training.data.in[,-55], method="pca", thresh=0.8) # find enough new predictors to explain 80% of the data variation
+trainPC <- predict(preProc, training.data.in[,-55]) # calculate the values of our simplified predictors
+pc.training <- cbind(trainPC, classe=training.data.in$classe) # bind the classe variable back on
+```
+The choice to create enough new predictors to account for 80% of the variation in the data was motivated by time needed to fit more complicated models, which we will see below.
+
+Because the quality of motion is likely a function of interactions between our variables, we can then try a non-linear method like a decision tree to create our predictor. However, this turns out not to be robust enough (several trials yielded trees that entirely lacked a ``classe="B"`` or ``classe="C"`` leaf).
+
+We thus try the more robust random forest technique, limiting the amount of data in our training set to constrain the amount of time to build the predictor. This produces more validation sets than expected, but this is not a problem.
+```{r decisionTree, cache=TRUE, warning=FALSE}
+set.seed(857)
+partition <- createFolds(pc.training$classe, k=10, list=FALSE)
+partition.indices1 <- which(partition == 1)
+pc.training.slice <- pc.training[partition.indices1,]
+decisionTree <- train(classe ~ ., method="rf", data=pc.training.slice)
+confusionMatrix(pc.training.slice$classe, predict(decisionTree))$table
+```
+We can now perform some cross validation on the other partitions of our data
+```{r crossValidation, message=FALSE}
+validation.indices <- lapply(2:10, function(i) which(partition == i)) # get indices for validation sets
+validation.stats <- function (i) {
+  validation <- pc.training[validation.indices[[i]],]
+  confusionMatrix(validation$classe, predict(decisionTree, newdata=validation))
+}
+accuracy.stats <- sapply(1:9, function(i) validation.stats(i)$overall["Accuracy"])
+m.a <- mean(accuracy.stats) # mean accuracy
+sd.a <- sd(accuracy.stats) # standard deviation of accuracy
+m.a + c(-1,1)*qt(.975, 8)*sd.a/sqrt(9) # 95% confidence interval for accuracy
+```
+Our random forest predictor is thus about 81% to 82% accurate within a 95% confidence interval. In other words, we can expect about 18% to 19% out-of-sample error.
+
+Finally, we can apply our predictor to the test data and see what predictions we obtain.
+```{r predictionTest}
+testPC <- predict(preProc, testing.data.in[,-55]) # calculate the values of our simplified predictors in the test data
+predict(decisionTree, newdata=testPC)
+```
